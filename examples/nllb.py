@@ -111,8 +111,9 @@ def load_weights_from_zip(model: NLLBModel, zip_path: str):
     zip_dir = Path(zip_path).parent
     extract_root = zip_dir / "extracted"
     extract_root.mkdir(exist_ok=True)
-    z.extract(entry, str(extract_root))
     extracted_path = extract_root / entry
+    if not extracted_path.exists():
+      z.extract(entry, str(extract_root))
 
   _load_from_bin(model, str(extracted_path))
 
