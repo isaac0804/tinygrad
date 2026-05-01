@@ -229,9 +229,42 @@ python -m examples.nllb --model_path "D:\models\nllb-600M-bc-bm-250817.zip" `
 
 ## Performance Baseline (AMD Radeon 780M, gfx1103, OpenCL)
 
-| Mode | JIT decode (24 tokens) | Throughput |
-|------|----------------------|------------|
-| fp32, no beam | ~50s | ~0.48 tok/s |
-| fp16 mixed, no beam | ~35s | ~0.66 tok/s |
-| fp32, after BEAM=2 | TBD | TBD |
-| fp16 mixed, after BEAM=2 | TBD | TBD |
+### Single-sentence (30-token budget, 23 generated tokens)
+
+| Mode | JIT decode (23 tokens) | Throughput | vs fp32 baseline |
+|------|----------------------|------------|-----------------|
+| fp32, no beam | ~50s | ~0.48 tok/s | 1.00x |
+| fp16 mixed, no beam | ~18.1s | ~1.27 tok/s | 2.64x |
+| fp32, after BEAM=2 | TBD | TBD | TBD |
+| fp16 mixed, after BEAM=2 | ~17.3s | ~1.33 tok/s | 2.77x |
+
+> fp16 beam search (`BEAM=2`) must be run once to populate `cache.db` before
+> using `beam_fp16` config — adds ~35 new beam entries on top of fp32 entries.
+
+### Extended benchmark (13 samples, 7 language pairs, 3 length tiers, max 80 tokens)
+
+Model: `nllb-600M-bc-bm-250817.zip` · Hardware: AMD Radeon 780M, gfx1103, OpenCL
+
+| Language Pair | Src tok | fp16 tok/s | beam_fp16 tok/s | fuse_fp16 tok/s | fuse_beam_fp16 tok/s |
+|---------------|---------|-----------|----------------|----------------|---------------------|
+| English→French (short) | 9 | 0.62 | 0.37 | 0.50 | 0.43 |
+| English→German (short) | 10 | 0.52 | 0.62 | 0.43 | 0.41 |
+| English→Chinese (short) | 9 | 1.37 | 0.89 | 0.96 | 0.90 |
+| English→French (medium) | 15 | 1.33 | 0.78 | 0.96 | 0.90 |
+| English→Spanish (medium) | 20 | 1.44 | 0.90 | 1.01 | 0.94 |
+| English→Arabic (medium) | 26 | 1.62 | 1.64 | 1.13 | 0.98 |
+| English→Japanese (medium) | 21 | 1.34 | 1.54 | 0.92 | 0.99 |
+| English→French (long) | 58 | 2.76 | 2.66 | 1.90 | 1.94 |
+| English→German (long) | 57 | 1.92 | 2.08 | 1.79 | 1.90 |
+| English→Chinese (long) | 67 | 2.46 | 2.04 | 1.69 | 1.60 |
+| French→English (medium) | 30 | 1.31 | 1.33 | 0.84 | 0.82 |
+| Spanish→English (medium) | 26 | 2.44 | 1.94 | 1.75 | 1.69 |
+| Spanish→French (medium) | 24 | 1.40 | 1.12 | 0.87 | 0.92 |
+| **Average** | | **1.58** | **1.38** | **1.13** | **1.11** |
+
+**Key observations:**
+- `fp16` is the fastest config overall at **1.58 tok/s** average — heuristics are already near-optimal for fp16 on this GPU
+- `FUSE_OPTIM` configs are consistently **slower** (~28% below `fp16`) — kernel fusion introduces overhead that outweighs the reduced launch count on this iGPU; the fused kernels produce different ASTs and their heuristic configs are suboptimal without a dedicated FUSE_OPTIM beam search pass
+- `beam_fp16` vs `fp16`: only −13% on average; occasionally faster on specific pairs (German short, Arabic, Japanese medium)
+- Both `fuse_*` configs would likely improve significantly after running `BEAM=2` with `FUSE_OPTIM=1` to cache optimal kernel configs
+- Throughput scales strongly with sequence length for all configs (short: ~0.4–1.4 tok/s, long: ~1.6–2.8 tok/s) — JIT amortisation dominates at short lengths

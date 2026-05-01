@@ -28,6 +28,7 @@ Usage:
 """
 
 import argparse, time, os, gc
+from pathlib import Path
 from typing import List, Optional, Union
 from contextlib import contextmanager
 
@@ -71,6 +72,12 @@ def run_inference(model_path: str, max_tokens: int, fp16: bool = False,
   because tinygrad reads them at import time via ContextVar.
   """
   # Late imports so env vars are already set
+  # Ensure repo root is on sys.path (needed when run as a subprocess)
+  import sys as _sys
+  _repo_root = str(Path(__file__).resolve().parent.parent)
+  if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+
   from tinygrad import Tensor, TinyJit, Variable, dtypes
   from tinygrad.nn.state import get_state_dict
   from extra.models.nllb import NLLBConfig, NLLBModel, remap_weights
@@ -219,6 +226,11 @@ def run_config_subprocess(config_name: str, model_path: str,
   env["_BENCH_CONFIG"]     = config_name
   env["_BENCH_MODEL_PATH"] = model_path
   env["_BENCH_MAX_TOKENS"] = str(max_tokens)
+
+  # Ensure the repo root is on PYTHONPATH for the child process
+  repo_root = str(Path(__file__).resolve().parent.parent)
+  pythonpath = env.get("PYTHONPATH", "")
+  env["PYTHONPATH"] = repo_root + (os.pathsep + pythonpath if pythonpath else "")
 
   cmd = [sys.executable, __file__, "--_run_config"]
   result = subprocess.run(cmd, env=env, capture_output=True, text=True,
