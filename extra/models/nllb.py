@@ -163,19 +163,15 @@ class M2M100Attention:
 
     if self.cross_attention:
       # Cross-attention: keys/values come from encoder output.
-      # key_value_states is provided on the first decoder step (start_pos==0),
-      # then we reuse the cached KV for subsequent steps.
-      if key_value_states is not None:
+      # Only compute k/v projections on the very first step (cache not yet populated).
+      # On all subsequent steps reuse the cache — avoids 12*2 redundant matmuls per token.
+      if not hasattr(self, 'cache_k'):
+        # First step: compute and cache
         k = self._shape(self.k_proj(key_value_states))
         v = self._shape(self.v_proj(key_value_states))
-        if not hasattr(self, 'cache_k'):
-          self.cache_k = k.contiguous().realize()
-          self.cache_v = v.contiguous().realize()
-        else:
-          self.cache_k.assign(k.contiguous()).realize()
-          self.cache_v.assign(v.contiguous()).realize()
-      else:
-        k, v = self.cache_k, self.cache_v
+        self.cache_k = k.contiguous().realize()
+        self.cache_v = v.contiguous().realize()
+      k, v = self.cache_k, self.cache_v
     else:
       # Self-attention with assign-based KV cache
       k_new = self._shape(self.k_proj(hidden_states))  # (B, H, tgt_len, head_dim)
@@ -415,6 +411,14 @@ class NLLBModel:
     self.decoder = M2M100Decoder(config, self.shared, max_cache_len=max_cache_len)
     # lm_head weight is tied to shared.weight (no separate parameter)
     # We do the projection manually in decode() using shared.weight
+
+  def reset_cache(self):
+    """Clear all KV caches (self-attn and cross-attn) across all decoder layers.
+    Call this between independent translation requests when reusing the same model instance."""
+    for layer in self.decoder.layers:
+      for attn in (layer.self_attn, layer.encoder_attn):
+        attn.__dict__.pop('cache_k', None)
+        attn.__dict__.pop('cache_v', None)
 
   def encode(self, input_ids: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
     """Run the encoder. Call once per input sequence."""
