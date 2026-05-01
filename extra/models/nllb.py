@@ -420,6 +420,22 @@ class NLLBModel:
         attn.__dict__.pop('cache_k', None)
         attn.__dict__.pop('cache_v', None)
 
+  def reorder_cache(self, beam_idx: "Tensor"):
+    """Reorder KV cache rows to match a new beam ordering.
+
+    Called after beam candidates are selected so that each cache slot aligns with
+    the beam that produced it.  beam_idx is a 1-D integer Tensor of shape
+    (beam_width,) where beam_idx[i] is the old cache slot to copy into new slot i.
+
+    Only the self-attn cache needs reordering; the cross-attn cache holds encoder
+    keys/values which are the same for all beams (they all attend the same source).
+    """
+    for layer in self.decoder.layers:
+      sa = layer.self_attn
+      if hasattr(sa, 'cache_k'):
+        sa.cache_k = sa.cache_k[beam_idx].contiguous().realize()
+        sa.cache_v = sa.cache_v[beam_idx].contiguous().realize()
+
   def encode(self, input_ids: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
     """Run the encoder. Call once per input sequence."""
     return self.encoder(input_ids, attention_mask)

@@ -204,8 +204,8 @@ def beam_search_decode(
   Sequence-level beam search decoding for NLLB.
 
   Runs `beam_width` hypothesis beams in parallel by expanding the batch dimension
-  to `beam_width`.  The model's KV-cache is initialised with bsz=beam_width on the
-  first decode call so all subsequent single-token steps are fully batched.
+  to `beam_width`.  After each step the KV cache rows are reordered to match the
+  selected beam ordering so every slot always corresponds to the right hypothesis.
 
   Args:
     model:                 NLLBModel (or NLLBModelFP16) instance.
@@ -222,7 +222,6 @@ def beam_search_decode(
   Returns:
     List of output token ids (excluding the initial [eos, lang_id] prompt).
   """
-  import math
   Tensor.training = False
 
   # ── Encode (bsz=1) ──────────────────────────────────────────────────────────
@@ -238,7 +237,7 @@ def beam_search_decode(
 
   # ── First decode step ───────────────────────────────────────────────────────
   # Feed [eos, forced_bos] for all B beams simultaneously so the cross-attn
-  # cache (shape B×H×src_len×head_dim) is built correctly.
+  # cache (shape B×H×src_len×head_dim) and self-attn cache are built at bsz=B.
   init_tokens = [eos_token_id, forced_bos_token_id]
   dec_in0 = Tensor(
     np.tile(np.array([init_tokens], dtype=np.int32), (beam_width, 1))
@@ -246,107 +245,115 @@ def beam_search_decode(
 
   with Timing("First decode step: "):
     logits0 = model.decode(dec_in0, enc_out_b, src_mask_b, start_pos=0)
-    # logits0: (B, 2, vocab) — take last position's logits for beam 0 (all same)
+    # All B rows are identical at this point — use row 0 to seed beams.
     log_probs0 = logits0[0, -1].log_softmax(axis=-1).numpy()     # (vocab,)
 
-  # Initialise beams from the top-k tokens of beam 0
-  vocab_size = log_probs0.shape[-1]
-  top_k_ids  = np.argsort(log_probs0)[::-1][:beam_width]
+  # Seed beams from top-B tokens.
+  # beam slot i will hold beam i — the cache rows already align.
+  top_k_ids = np.argsort(log_probs0)[::-1][:beam_width]
 
-  # Each beam: (score, token_sequence, finished)
-  # token_sequence includes the init_tokens prefix (stripped at the end)
+  # beam dict: score (cumulative log-prob), tokens (full sequence incl. init),
+  #            finished flag, slot (which cache row this beam currently owns).
   beams: list = []
-  for i, tok in enumerate(top_k_ids):
+  for slot, tok in enumerate(top_k_ids):
     beams.append({
       "score":    float(log_probs0[tok]),
       "tokens":   list(init_tokens) + [int(tok)],
       "finished": int(tok) == eos_token_id,
+      "slot":     slot,
     })
 
   if verbose:
     print(f"  beam_width={beam_width}  initial top tokens: {top_k_ids.tolist()}")
 
   # ── JIT-compiled single-token decode ────────────────────────────────────────
+  # NOTE: TinyJit is NOT used here because reorder_cache() invalidates the
+  # previously realized cache tensors between steps, which breaks JIT capture.
+  # The per-step cost is dominated by the matmuls anyway; kernel recompilation
+  # is amortised after the first ~3 steps via the compile cache.
   max_start  = max_new_tokens + len(init_tokens) + 5
-  decode_jit = TinyJit(
-    lambda tok, sp: model.decode(tok, enc_out_b, src_mask_b, start_pos=sp)
-  )
 
   completed: list = []
 
-  with Timing("Beam decode (JIT): "):
+  with Timing("Beam decode: "):
     for step in range(1, max_new_tokens):
-      # Select active beams
-      active = [b for b in beams if not b["finished"]]
-      if not active:
+      active_count = sum(1 for b in beams if not b["finished"])
+      if active_count == 0:
         break
 
-      # Build decoder input: last token of each active beam, shape (B, 1)
-      # Pad inactive beams with pad token so tensor is always (beam_width, 1)
+      # ── Build (B, 1) decoder input in slot order ──────────────────────────
+      # Finished beams still participate so the batch shape stays constant;
+      # their logits are discarded.
       last_tokens = np.array(
         [[b["tokens"][-1]] for b in beams], dtype=np.int32
       )  # (B, 1)
       dec_in = Tensor(last_tokens)
 
-      sp     = Variable("start_pos", 1, max_start).bind(len(beams[0]["tokens"]) - 1)
-      logits = decode_jit(dec_in, sp)                             # (B, 1, vocab)
-      lp     = logits[:, -1, :].log_softmax(axis=-1).numpy()     # (B, vocab)
+      start_pos = len(beams[0]["tokens"]) - 1   # same for all beams
+      logits = model.decode(dec_in, enc_out_b, src_mask_b, start_pos=start_pos)
+      lp = logits[:, -1, :].log_softmax(axis=-1).numpy()         # (B, vocab)
 
-      # Expand each active beam by top-k
-      candidates = []
-      for b_idx, beam in enumerate(beams):
-        if beam["finished"]:
-          # Keep finished beams as-is (score doesn't change)
-          candidates.append((beam["score"], b_idx, eos_token_id, True))
-          continue
-        top_k = np.argsort(lp[b_idx])[::-1][:beam_width]
-        for tok in top_k:
-          new_score = beam["score"] + float(lp[b_idx][tok])
-          candidates.append((new_score, b_idx, int(tok), int(tok) == eos_token_id))
-
-      # Length-normalise and pick top beam_width
+      # ── Expand each active beam by top-B candidates ───────────────────────
       def norm_score(score: float, length: int) -> float:
         return score / (length ** length_penalty) if length > 0 else score
 
-      cur_len = len(beams[0]["tokens"])
-      candidates.sort(key=lambda c: norm_score(c[0], cur_len + (0 if c[3] else 1)), reverse=True)
+      candidates = []
+      for b_idx, beam in enumerate(beams):
+        if beam["finished"]:
+          # Propagate finished beam unchanged; its slot index is preserved.
+          candidates.append({
+            "score":    beam["score"],
+            "tokens":   beam["tokens"],
+            "finished": True,
+            "src_slot": b_idx,         # cache row to copy from
+          })
+          continue
+        top_k = np.argsort(lp[b_idx])[::-1][:beam_width]
+        new_len = len(beam["tokens"]) + 1
+        for tok in top_k:
+          new_score = beam["score"] + float(lp[b_idx][tok])
+          candidates.append({
+            "score":    new_score,
+            "tokens":   beam["tokens"] + [int(tok)],
+            "finished": int(tok) == eos_token_id,
+            "src_slot": b_idx,
+          })
 
-      new_beams = []
-      for score, b_idx, tok, finished in candidates[:beam_width]:
-        new_beam = {
-          "score":    score,
-          "tokens":   beams[b_idx]["tokens"] + [tok],
-          "finished": finished,
-        }
-        new_beams.append(new_beam)
+      # Sort by length-normalised score, keep top beam_width.
+      candidates.sort(
+        key=lambda c: norm_score(c["score"], len(c["tokens"]) - len(init_tokens)),
+        reverse=True,
+      )
+      selected = candidates[:beam_width]
 
-      beams = new_beams
+      # ── Reorder KV cache to match selected beam ordering ──────────────────
+      # selected[i]["src_slot"] is the old cache row that new slot i should
+      # copy from.  We build this permutation and apply it once.
+      slot_order = np.array([c["src_slot"] for c in selected], dtype=np.int32)
+      model.reorder_cache(Tensor(slot_order))
+
+      # Assign new slot indices and update beam list.
+      beams = []
+      for new_slot, cand in enumerate(selected):
+        beams.append({
+          "score":    cand["score"],
+          "tokens":   cand["tokens"],
+          "finished": cand["finished"],
+          "slot":     new_slot,
+        })
 
       if verbose:
-        best = max(beams, key=lambda b: norm_score(b["score"], len(b["tokens"])))
+        best = beams[0]  # already sorted
         print(f"  step {step+1}: best score={best['score']:.3f}  "
               f"tok={best['tokens'][-1]}", end="\r")
 
-      # Move finished beams to completed pool
-      still_running = []
+      # Collect newly finished beams.
       for b in beams:
         if b["finished"]:
           completed.append(b)
-        else:
-          still_running.append(b)
 
-      # If we have enough completed beams, stop early
+      # Early exit once we have beam_width completed hypotheses.
       if len(completed) >= beam_width:
-        break
-
-      # Pad beams list back to beam_width with copies of the best active beam
-      # so the batch tensor shape stays constant
-      if still_running:
-        best_active = max(still_running, key=lambda b: b["score"])
-        while len(still_running) < beam_width:
-          still_running.append(dict(best_active))
-        beams = still_running
-      else:
         break
 
   if verbose:
@@ -361,7 +368,7 @@ def beam_search_decode(
 
   best_beam = max(pool, key=final_score)
 
-  # Strip init_tokens prefix and trailing EOS
+  # Strip init_tokens prefix and trailing EOS.
   output = best_beam["tokens"][len(init_tokens):]
   if output and output[-1] == eos_token_id:
     output = output[:-1]
